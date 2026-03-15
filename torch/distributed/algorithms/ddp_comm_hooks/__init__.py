@@ -25,6 +25,7 @@ from . import (
     optimizer_overlap_hooks as optimizer_overlap,
     powerSGD_hook as powerSGD,
     quantization_hooks as quantization,
+    arc_topK_hook as arc_topK,
 )
 
 
@@ -33,6 +34,34 @@ __all__ = ["DDPCommHookType", "register_ddp_comm_hook"]
 
 def _ddp_comm_hook_wrapper(comm_hook, model, state):
     model.register_comm_hook(state, comm_hook)
+
+
+def _quantization_comm_hook_wrapper(
+    comm_hook,
+    model,
+    state,
+    use_error_feedback=True,
+):
+    quantization_state = quantization.QuantizationState(
+        process_group=state,
+        use_error_feedback=use_error_feedback,
+    )
+    model.register_comm_hook(quantization_state, comm_hook)
+
+
+def _arc_topK_comm_hook_wrapper(
+    comm_hook,
+    model,
+    state,
+    priority_rank=4,
+    compression_ratio=0.05,
+):
+    arc_topK_state = arc_topK.ArcTopKState(
+        process_group=state,
+        priority_rank=priority_rank,
+        compression_ratio=compression_ratio,
+    )
+    model.register_comm_hook(arc_topK_state, comm_hook)
 
 
 def _powerSGD_comm_hook_wrapper(
@@ -84,6 +113,9 @@ class DDPCommHookType(Enum):
         partial(
             _ddp_comm_hook_wrapper, comm_hook=quantization.quantization_perchannel_hook
         )
+    )
+    ARC_TOPK_HOOK = _enum_member(
+        partial(_arc_topK_comm_hook_wrapper, comm_hook=arc_topK.arc_topK_hook)
     )
     POWER_SGD = _enum_member(
         partial(

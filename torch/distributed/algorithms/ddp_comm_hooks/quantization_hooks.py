@@ -43,8 +43,55 @@ def _get_allgather_out_list(all_gather_in_list, world_size):
     return out_list
 
 
+class QuantizationState:
+    __slots__ = [
+        "process_group",
+        "use_error_feedback",
+        "error_dict",
+    ]
+
+    def __init__(
+        self,
+        process_group=None,
+        use_error_feedback=True,
+    ):
+        self.process_group = process_group
+        self.use_error_feedback = use_error_feedback
+        self.error_dict: dict[int, torch.Tensor] = {}
+
+    def __getstate__(self):
+        r"""
+        Return a ``Dict[str, Any]`` which will be pickled and saved.
+
+        ``process_group`` is not serializable and excluded from
+        a returned state.
+        """
+        logger.warning(
+            "NOTE: Process group is not serializable and excluded from a saved state."
+        )
+        return {
+            slot: getattr(self, slot)
+            for slot in self.__slots__
+            if slot != "process_group"
+        }
+
+    def __setstate__(self, state):
+        r"""
+        Take a provided ``state`` and set to this ``PowerSGDState`` instance.
+
+        ``process_group`` is set to default.
+        """
+        self.process_group = distributed_c10d._get_default_group()
+        logger.warning(
+            "NOTE: Process group will be set to a default group (i.e. the world size).\
+                If a different group is desired, please set `self.process_group` after PowerSGD state is loaded."
+        )
+        for slot, value in state.items():
+            setattr(self, slot, value)
+
+
 def quantization_pertensor_hook(
-    process_group: dist.ProcessGroup, bucket: dist.GradBucket
+    state: QuantizationState, bucket: dist.GradBucket
 ) -> torch.futures.Future[torch.Tensor]:
     """
     Apply ``torch.quantize_per_tensor`` logic to DDP using ``allgather`` protocol.
@@ -64,12 +111,28 @@ def quantization_pertensor_hook(
         >>> # xdoctest: +SKIP
         >>> ddp_model.register_comm_hook(process_group, quantization_pertensor_hook)
     """
+    process_group = state.process_group
     group_to_use = process_group if process_group is not None else dist.group.WORLD
     rank = process_group.rank() if process_group is not None else dist.get_rank()
     # pyrefly: ignore [missing-attribute]
     world_size = group_to_use.size()
 
     tensor = bucket.buffer()
+
+    # insert error feedback
+    bucket_index = bucket.index()
+    total_length = tensor.shape[0]
+    if state.use_error_feedback:
+        if bucket_index in state.error_dict:
+            tensor.add_(state.error_dict[bucket_index])
+        else:
+            logger.info(
+                "A zero tensor of length %s that represents local error is created.",
+                total_length,
+            )
+            state.error_dict[bucket_index] = torch.zeros(
+                total_length, device=device, dtype=dtype
+            )
 
     myObserver = torch.ao.quantization.MinMaxObserver().to(tensor.device)
     myObserver(tensor)
@@ -91,6 +154,11 @@ def quantization_pertensor_hook(
         quantized_tensor = _quantize_per_tensor_backend(
             tensor, all_ranks_s_and_z[rank][0], all_ranks_s_and_z[rank][1]
         )
+        # Store quantization error in error_dict
+        if state.use_error_feedback:
+            if quantized_tensor is None:
+                raise AssertionError
+            state.error_dict[bucket_index] = tensor - quantized_tensor
         # Allgather quantized tensors.
         fut = dist.all_gather(
             _get_allgather_out_list(quantized_tensor, world_size),
@@ -120,7 +188,7 @@ def quantization_pertensor_hook(
 
 
 def quantization_perchannel_hook(
-    process_group: dist.ProcessGroup, bucket: dist.GradBucket, bucket_size=512
+    state: QuantizationState, bucket: dist.GradBucket, bucket_size=512
 ) -> torch.futures.Future[torch.Tensor]:
     """
     Apply``torch.quantize_per_channel`` logic to DDP using ``allgather`` protocol.
@@ -146,12 +214,28 @@ def quantization_perchannel_hook(
         >>> # xdoctest: +SKIP
         >>> ddp_model.register_comm_hook(process_group, quantization_perchannel_hook)
     """
+    process_group = state.process_group
     group_to_use = process_group if process_group is not None else dist.group.WORLD
     rank = process_group.rank() if process_group is not None else dist.get_rank()
     # pyrefly: ignore [missing-attribute]
     world_size = group_to_use.size()
 
     tensor = bucket.buffer()
+
+    # insert error feedback
+    bucket_index = bucket.index()
+    total_length = tensor.shape[0]
+    if state.use_error_feedback:
+        if bucket_index in state.error_dict:
+            tensor.add_(state.error_dict[bucket_index])
+        else:
+            logger.info(
+                "A zero tensor of length %s that represents local error is created.",
+                total_length,
+            )
+            state.error_dict[bucket_index] = torch.zeros(
+                total_length, device=device, dtype=dtype
+            )
 
     tensor_in_channels = (
         nn.functional.pad(
@@ -187,6 +271,14 @@ def quantization_perchannel_hook(
             all_ranks_s_and_z[rank, 0, :],
             all_ranks_s_and_z[rank, 1, :],
         )
+        # Store quantization error in error_dict
+        if state.use_error_feedback:
+            if quantized_tensor is None:
+                raise AssertionError
+            n = tensor.numel()
+            shape = tensor.shape
+            restored_quantized_tensor = quantized_tensor.flatten()[:n].view(shape)
+            state.error_dict[bucket_index] = tensor - restored_quantized_tensor
         # Allgather quantized tensors.
         fut = dist.all_gather(
             _get_allgather_out_list(quantized_tensor, world_size),
