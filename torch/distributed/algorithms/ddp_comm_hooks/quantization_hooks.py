@@ -4,9 +4,9 @@ import torch.distributed as dist
 from torch import nn
 
 
-def _quantize_per_tensor_backend(x, scale, zero_point):
+def _quantize_per_tensor_backend(x, scale, zero_point, dtype):
     y = torch.round(x / scale) + zero_point
-    y = torch.clamp(y, 0, 255).to(torch.uint8)
+    y = torch.clamp(y, dtype.min, dtype.max).to(dtype)
     return y
 
 
@@ -15,11 +15,11 @@ def _dequantize_per_tensor_backend(y, scale, zero_point):
     return x
 
 
-def _quantize_per_channel_backend(x, scale, zero_point):
+def _quantize_per_channel_backend(x, scale, zero_point, dtype):
     y = torch.zeros(x.size(), device=x.device)
     for i in range(x.size()[0]):
         y[i, :] = torch.round(x[i, :] / scale[i]) + zero_point[i]
-    y = torch.clamp(y, 0, 255).to(torch.uint8)
+    y = torch.clamp(y, dtype.min, dtype.max).to(dtype)
     return y
 
 
@@ -48,16 +48,20 @@ class QuantizationState:
         "process_group",
         "use_error_feedback",
         "error_dict",
+        "dtype",
+        "use_hadamard_transformation"
     ]
 
     def __init__(
         self,
         process_group=None,
         use_error_feedback=True,
+        dtype=torch.uint8,
     ):
         self.process_group = process_group
         self.use_error_feedback = use_error_feedback
         self.error_dict: dict[int, torch.Tensor] = {}
+        self.dtype = dtype
 
     def __getstate__(self):
         r"""
@@ -134,7 +138,9 @@ def quantization_pertensor_hook(
                 total_length, device=device, dtype=dtype
             )
 
-    myObserver = torch.ao.quantization.MinMaxObserver().to(tensor.device)
+    # TODO: recheck if dtype is correct. The previous dtype is torch.quint8, which
+    #   is also the default parameter for MinMaxObserver.
+    myObserver = torch.ao.quantization.MinMaxObserver(dtype=state.dtype).to(tensor.device)
     myObserver(tensor)
 
     s, z = myObserver.calculate_qparams()
@@ -152,7 +158,7 @@ def quantization_pertensor_hook(
         all_ranks_s_and_z = fut.wait()[0]
         # All workers quantize their own ``GradBucket`` tensors.
         quantized_tensor = _quantize_per_tensor_backend(
-            tensor, all_ranks_s_and_z[rank][0], all_ranks_s_and_z[rank][1]
+            tensor, all_ranks_s_and_z[rank][0], all_ranks_s_and_z[rank][1], state.dtype
         )
         # Store quantization error in error_dict
         if state.use_error_feedback:
@@ -248,9 +254,11 @@ def quantization_perchannel_hook(
         .to(tensor.device)
     )
 
-    myPerChannelObserver = torch.ao.quantization.PerChannelMinMaxObserver().to(
-        tensor.device
-    )
+    # TODO: recheck if dtype is correct. The previous dtype is torch.quint8, which
+    #   is also the default parameter for MinMaxObserver.
+    myPerChannelObserver = torch.ao.quantization.PerChannelMinMaxObserver(
+        dtype=state.dtype
+    ).to(tensor.device)
     myPerChannelObserver(tensor_in_channels)
 
     s_ch, z_ch = myPerChannelObserver.calculate_qparams()
@@ -270,6 +278,7 @@ def quantization_perchannel_hook(
             tensor_in_channels,
             all_ranks_s_and_z[rank, 0, :],
             all_ranks_s_and_z[rank, 1, :],
+            state.dtype,
         )
         # Store quantization error in error_dict
         if state.use_error_feedback:

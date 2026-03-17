@@ -3,6 +3,7 @@ import sys
 from enum import Enum
 from functools import partial
 
+import torch
 
 # To suppress FutureWarning from partial since 3.13
 if sys.version_info >= (3, 11):
@@ -40,11 +41,14 @@ def _quantization_comm_hook_wrapper(
     comm_hook,
     model,
     state,
-    use_error_feedback=True,
+    # TODO: turn off error-feedback for now
+    use_error_feedback=False,
+    dtype=torch.uint8,
 ):
     quantization_state = quantization.QuantizationState(
         process_group=state,
         use_error_feedback=use_error_feedback,
+        dtype=dtype,
     )
     model.register_comm_hook(quantization_state, comm_hook)
 
@@ -112,6 +116,20 @@ class DDPCommHookType(Enum):
     QUANTIZE_PER_CHANNEL = _enum_member(
         partial(
             _ddp_comm_hook_wrapper, comm_hook=quantization.quantization_perchannel_hook
+        )
+    )
+    QUANTIZE_PER_TENSOR_FP8 = _enum_member(
+        partial(
+            _ddp_comm_hook_wrapper,
+            comm_hook=quantization.quantization_pertensor_hook,
+            dtype=torch.float8_e4m3fn
+        )
+    )
+    QUANTIZE_PER_CHANNEL_FP8 = _enum_member(
+        partial(
+            _ddp_comm_hook_wrapper,
+            comm_hook=quantization.quantization_perchannel_hook,
+            dtype=torch.float8_e4m3fn
         )
     )
     ARC_TOPK_HOOK = _enum_member(
