@@ -173,6 +173,42 @@ class DistributedDataParallelCommHookTest(DistributedTestBase):
 
     @requires_accelerator_dist_backend()
     @skip_if_lt_x_gpu(2)
+    def test_ddp_comm_hook_quantize_per_tensor_fp8_hook(self):
+        """
+        This unit test verifies the ``quantize per tensor fp8`` hook registered case
+        gives close result with no hook registered case.
+        """
+        process_group = self.create_pg(device_type)
+
+        # No hook registered case, get the reference grads.
+        reference_grads = self._get_grads(process_group, None)
+        # Register hook case, get the hook grads.
+        hook_grads = self._get_grads(
+            process_group, DDPCommHookType.QUANTIZE_PER_TENSOR_FP8
+        )
+
+        torch.testing.assert_close(hook_grads, reference_grads, rtol=1e-5, atol=1e-4)
+
+    @requires_accelerator_dist_backend()
+    @skip_if_lt_x_gpu(2)
+    def test_ddp_comm_hook_quantize_per_channel_fp8_hook(self):
+        """
+        This unit test verifies the ``quantize per channel fp8`` hook registered case
+        gives close result with no hook registered case.
+        """
+        process_group = self.create_pg(device_type)
+
+        # No hook registered case, get the reference grads.
+        reference_grads = self._get_grads(process_group, None)
+        # Register hook case, get the hook grads.
+        hook_grads = self._get_grads(
+            process_group, DDPCommHookType.QUANTIZE_PER_TENSOR_FP8
+        )
+
+        torch.testing.assert_close(hook_grads, reference_grads, rtol=1e-5, atol=1e-4)
+
+    @requires_accelerator_dist_backend()
+    @skip_if_lt_x_gpu(2)
     def test_ddp_comm_hook_noop_hook(self):
         """
         This unit test verifies the ``noop`` hook registered case and a subsequent allreduce
