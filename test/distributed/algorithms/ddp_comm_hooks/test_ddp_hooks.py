@@ -187,7 +187,7 @@ class DistributedDataParallelCommHookTest(DistributedTestBase):
             process_group, DDPCommHookType.QUANTIZE_PER_TENSOR_FP8
         )
 
-        torch.testing.assert_close(hook_grads, reference_grads, rtol=1e1, atol=1e-3)
+        torch.testing.assert_close(hook_grads, reference_grads, rtol=1e-5, atol=1e-3)
 
     @requires_accelerator_dist_backend()
     @skip_if_lt_x_gpu(2)

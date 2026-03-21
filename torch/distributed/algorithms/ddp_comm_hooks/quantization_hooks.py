@@ -14,7 +14,10 @@ def _get_dtype_range(dtype):
 
 def _quantize_per_tensor_backend(x, scale, zero_point, dtype):
     d_min, d_max = _get_dtype_range(dtype)
-    y = torch.round(x / scale) + zero_point
+    if dtype.is_floating_point:
+        y = x / scale + zero_point
+    else:
+        y = torch.round(x / scale) + zero_point
     y = torch.clamp(y, d_min, d_max).to(dtype)
     return y
 
@@ -28,7 +31,10 @@ def _quantize_per_channel_backend(x, scale, zero_point, dtype):
     d_min, d_max = _get_dtype_range(dtype)
     y = torch.zeros(x.size(), device=x.device)
     for i in range(x.size()[0]):
-        y[i, :] = torch.round(x[i, :] / scale[i]) + zero_point[i]
+        if dtype.is_floating_point:
+            y[i, :] = x[i, :] / scale[i] + zero_point[i]
+        else:
+            y[i, :] = torch.round(x[i, :] / scale[i]) + zero_point[i]
     y = torch.clamp(y, d_min, d_max).to(dtype)
     return y
 
