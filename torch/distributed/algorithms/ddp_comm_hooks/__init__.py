@@ -26,7 +26,6 @@ from . import (
     optimizer_overlap_hooks as optimizer_overlap,
     powerSGD_hook as powerSGD,
     quantization_hooks as quantization,
-    arc_topK_hook as arc_topK,
 )
 
 
@@ -120,20 +119,17 @@ class DDPCommHookType(Enum):
     )
     QUANTIZE_PER_TENSOR_FP8 = _enum_member(
         partial(
-            _ddp_comm_hook_wrapper,
+            _quantization_comm_hook_wrapper,
             comm_hook=quantization.quantization_pertensor_hook,
             dtype=torch.float8_e4m3fn
         )
     )
     QUANTIZE_PER_CHANNEL_FP8 = _enum_member(
         partial(
-            _ddp_comm_hook_wrapper,
+            _quantization_comm_hook_wrapper,
             comm_hook=quantization.quantization_perchannel_hook,
             dtype=torch.float8_e4m3fn
         )
-    )
-    ARC_TOPK_HOOK = _enum_member(
-        partial(_arc_topK_comm_hook_wrapper, comm_hook=arc_topK.arc_topK_hook)
     )
     POWER_SGD = _enum_member(
         partial(

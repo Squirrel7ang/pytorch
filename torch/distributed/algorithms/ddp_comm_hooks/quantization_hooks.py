@@ -4,9 +4,18 @@ import torch.distributed as dist
 from torch import nn
 
 
+def _get_dtype_range(dtype):
+    if dtype.is_floating_point:
+        info = torch.finfo(dtype)
+    else:
+        info = torch.iinfo(dtype)
+    return info.min, info.max
+
+
 def _quantize_per_tensor_backend(x, scale, zero_point, dtype):
+    d_min, d_max = _get_dtype_range(dtype)
     y = torch.round(x / scale) + zero_point
-    y = torch.clamp(y, dtype.min, dtype.max).to(dtype)
+    y = torch.clamp(y, d_min, d_max).to(dtype)
     return y
 
 
@@ -16,10 +25,11 @@ def _dequantize_per_tensor_backend(y, scale, zero_point):
 
 
 def _quantize_per_channel_backend(x, scale, zero_point, dtype):
+    d_min, d_max = _get_dtype_range(dtype)
     y = torch.zeros(x.size(), device=x.device)
     for i in range(x.size()[0]):
         y[i, :] = torch.round(x[i, :] / scale[i]) + zero_point[i]
-    y = torch.clamp(y, dtype.min, dtype.max).to(dtype)
+    y = torch.clamp(y, d_min, d_max).to(dtype)
     return y
 
 
