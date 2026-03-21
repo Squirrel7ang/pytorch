@@ -124,7 +124,7 @@ def arc_topK_hook(
     gradient = bucket.buffer()
     d = gradient.numel()
     row_num = _cal_max_factor(d)
-    gradient = gradient.view(row_num, -1)
+    gradient = gradient.view(-1, row_num)
 
     # calculate global priority
     V = torch.randn(row_num, state.priority_rank, device=gradient.device, dtype=gradient.dtype)
@@ -132,23 +132,31 @@ def arc_topK_hook(
     fut = dist.all_reduce(
         P, group=state.process_group, async_op=True
     ).get_future()
+    
+    indices_holder = []
 
     def compress_and_allreduce(fut):
         score = torch.diag(torch.matmul(P, P.T))
-        indices = torch.topk(score, k=state.compression_ratio).indices
+        col_num = d / row_num
+        K = max(1, int(col_num * state.compression_ratio))
+        indices = torch.topk(score, k=K).indices
+        indices_holder.append(indices)
 
         comm_gradient = gradient[indices, :]
         comm_fut = dist.all_reduce(
             comm_gradient, group=state.process_group, async_op=True
         ).get_future()
 
-        def decompress_and_finalize(fut):
-            avg_gradient = fut.wait()[0] / world_size
-            gradient.zero_()
-            gradient[indices, :] = avg_gradient
-            return gradient
+        return comm_fut.wait()
 
-        return comm_fut.then(decompress_and_finalize)
+
+    def decompress_and_finalize(fut):
+        avg_gradient = fut.wait()[0] / world_size
+        indices = indices_holder[0]
+        gradient.zero_()
+        gradient[indices, :] = avg_gradient
+
+        return gradient
 
 
     return fut.then(compress_and_allreduce).then(decompress_and_finalize)

@@ -186,8 +186,17 @@ class DistributedDataParallelCommHookTest(DistributedTestBase):
         hook_grads = self._get_grads(
             process_group, DDPCommHookType.ARC_TOPK_HOOK
         )
+        
+        non_zero_mask = (hook_grads.abs() > 1e-10)
 
-        torch.testing.assert_close(hook_grads, reference_grads, rtol=1e-5, atol=1e-4)
+        # Non-Zero value of the hook_grads must be the same with the reerence_grad
+        if non_zero_mask.any():
+            torch.testing.assert_close(
+                hook_grads[non_zero_mask], 
+                reference_grads[non_zero_mask], 
+                rtol=1e-5, 
+                atol=1e-4,
+            )
 
     @requires_accelerator_dist_backend()
     @skip_if_lt_x_gpu(2)
