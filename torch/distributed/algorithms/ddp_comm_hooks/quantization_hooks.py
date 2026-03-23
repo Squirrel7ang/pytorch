@@ -4,9 +4,21 @@ import torch.distributed as dist
 from torch import nn
 
 
-def _quantize_per_tensor_backend(x, scale, zero_point):
-    y = torch.round(x / scale) + zero_point
-    y = torch.clamp(y, 0, 255).to(torch.uint8)
+def _get_dtype_range(dtype):
+    if dtype.is_floating_point:
+        info = torch.finfo(dtype)
+    else:
+        info = torch.iinfo(dtype)
+    return info.min, info.max
+
+
+def _quantize_per_tensor_backend(x, scale, zero_point, dtype):
+    d_min, d_max = _get_dtype_range(dtype)
+    if dtype.is_floating_point:
+        y = x / scale + zero_point
+    else:
+        y = torch.round(x / scale) + zero_point
+    y = torch.clamp(y, d_min, d_max).to(dtype)
     return y
 
 
@@ -15,11 +27,15 @@ def _dequantize_per_tensor_backend(y, scale, zero_point):
     return x
 
 
-def _quantize_per_channel_backend(x, scale, zero_point):
+def _quantize_per_channel_backend(x, scale, zero_point, dtype):
+    d_min, d_max = _get_dtype_range(dtype)
     y = torch.zeros(x.size(), device=x.device)
     for i in range(x.size()[0]):
-        y[i, :] = torch.round(x[i, :] / scale[i]) + zero_point[i]
-    y = torch.clamp(y, 0, 255).to(torch.uint8)
+        if dtype.is_floating_point:
+            y[i, :] = x[i, :] / scale[i] + zero_point[i]
+        else:
+            y[i, :] = torch.round(x[i, :] / scale[i]) + zero_point[i]
+    y = torch.clamp(y, d_min, d_max).to(dtype)
     return y
 
 
@@ -43,8 +59,59 @@ def _get_allgather_out_list(all_gather_in_list, world_size):
     return out_list
 
 
+class QuantizationState:
+    __slots__ = [
+        "process_group",
+        "use_error_feedback",
+        "error_dict",
+        "dtype",
+        "use_hadamard_transformation"
+    ]
+
+    def __init__(
+        self,
+        process_group=None,
+        use_error_feedback=True,
+        dtype=torch.uint8,
+    ):
+        self.process_group = process_group
+        self.use_error_feedback = use_error_feedback
+        self.error_dict: dict[int, torch.Tensor] = {}
+        self.dtype = dtype
+
+    def __getstate__(self):
+        r"""
+        Return a ``Dict[str, Any]`` which will be pickled and saved.
+
+        ``process_group`` is not serializable and excluded from
+        a returned state.
+        """
+        logger.warning(
+            "NOTE: Process group is not serializable and excluded from a saved state."
+        )
+        return {
+            slot: getattr(self, slot)
+            for slot in self.__slots__
+            if slot != "process_group"
+        }
+
+    def __setstate__(self, state):
+        r"""
+        Take a provided ``state`` and set to this ``PowerSGDState`` instance.
+
+        ``process_group`` is set to default.
+        """
+        self.process_group = distributed_c10d._get_default_group()
+        logger.warning(
+            "NOTE: Process group will be set to a default group (i.e. the world size).\
+                If a different group is desired, please set `self.process_group` after PowerSGD state is loaded."
+        )
+        for slot, value in state.items():
+            setattr(self, slot, value)
+
+
 def quantization_pertensor_hook(
-    process_group: dist.ProcessGroup, bucket: dist.GradBucket
+    state: QuantizationState, bucket: dist.GradBucket
 ) -> torch.futures.Future[torch.Tensor]:
     """
     Apply ``torch.quantize_per_tensor`` logic to DDP using ``allgather`` protocol.
@@ -64,6 +131,7 @@ def quantization_pertensor_hook(
         >>> # xdoctest: +SKIP
         >>> ddp_model.register_comm_hook(process_group, quantization_pertensor_hook)
     """
+    process_group = state.process_group
     group_to_use = process_group if process_group is not None else dist.group.WORLD
     rank = process_group.rank() if process_group is not None else dist.get_rank()
     # pyrefly: ignore [missing-attribute]
@@ -71,7 +139,24 @@ def quantization_pertensor_hook(
 
     tensor = bucket.buffer()
 
-    myObserver = torch.ao.quantization.MinMaxObserver().to(tensor.device)
+    # insert error feedback
+    bucket_index = bucket.index()
+    total_length = tensor.shape[0]
+    if state.use_error_feedback:
+        if bucket_index in state.error_dict:
+            tensor.add_(state.error_dict[bucket_index])
+        else:
+            logger.info(
+                "A zero tensor of length %s that represents local error is created.",
+                total_length,
+            )
+            state.error_dict[bucket_index] = torch.zeros(
+                total_length, device=device, dtype=dtype
+            )
+
+    # TODO: recheck if dtype is correct. The previous dtype is torch.quint8, which
+    #   is also the default parameter for MinMaxObserver.
+    myObserver = torch.ao.quantization.MinMaxObserver(dtype=state.dtype).to(tensor.device)
     myObserver(tensor)
 
     s, z = myObserver.calculate_qparams()
@@ -89,8 +174,13 @@ def quantization_pertensor_hook(
         all_ranks_s_and_z = fut.wait()[0]
         # All workers quantize their own ``GradBucket`` tensors.
         quantized_tensor = _quantize_per_tensor_backend(
-            tensor, all_ranks_s_and_z[rank][0], all_ranks_s_and_z[rank][1]
+            tensor, all_ranks_s_and_z[rank][0], all_ranks_s_and_z[rank][1], state.dtype
         )
+        # Store quantization error in error_dict
+        if state.use_error_feedback:
+            if quantized_tensor is None:
+                raise AssertionError
+            state.error_dict[bucket_index] = tensor - quantized_tensor
         # Allgather quantized tensors.
         fut = dist.all_gather(
             _get_allgather_out_list(quantized_tensor, world_size),
@@ -120,7 +210,7 @@ def quantization_pertensor_hook(
 
 
 def quantization_perchannel_hook(
-    process_group: dist.ProcessGroup, bucket: dist.GradBucket, bucket_size=512
+    state: QuantizationState, bucket: dist.GradBucket, bucket_size=512
 ) -> torch.futures.Future[torch.Tensor]:
     """
     Apply``torch.quantize_per_channel`` logic to DDP using ``allgather`` protocol.
@@ -146,12 +236,28 @@ def quantization_perchannel_hook(
         >>> # xdoctest: +SKIP
         >>> ddp_model.register_comm_hook(process_group, quantization_perchannel_hook)
     """
+    process_group = state.process_group
     group_to_use = process_group if process_group is not None else dist.group.WORLD
     rank = process_group.rank() if process_group is not None else dist.get_rank()
     # pyrefly: ignore [missing-attribute]
     world_size = group_to_use.size()
 
     tensor = bucket.buffer()
+
+    # insert error feedback
+    bucket_index = bucket.index()
+    total_length = tensor.shape[0]
+    if state.use_error_feedback:
+        if bucket_index in state.error_dict:
+            tensor.add_(state.error_dict[bucket_index])
+        else:
+            logger.info(
+                "A zero tensor of length %s that represents local error is created.",
+                total_length,
+            )
+            state.error_dict[bucket_index] = torch.zeros(
+                total_length, device=device, dtype=dtype
+            )
 
     tensor_in_channels = (
         nn.functional.pad(
@@ -164,9 +270,11 @@ def quantization_perchannel_hook(
         .to(tensor.device)
     )
 
-    myPerChannelObserver = torch.ao.quantization.PerChannelMinMaxObserver().to(
-        tensor.device
-    )
+    # TODO: recheck if dtype is correct. The previous dtype is torch.quint8, which
+    #   is also the default parameter for MinMaxObserver.
+    myPerChannelObserver = torch.ao.quantization.PerChannelMinMaxObserver(
+        dtype=state.dtype
+    ).to(tensor.device)
     myPerChannelObserver(tensor_in_channels)
 
     s_ch, z_ch = myPerChannelObserver.calculate_qparams()
@@ -186,7 +294,16 @@ def quantization_perchannel_hook(
             tensor_in_channels,
             all_ranks_s_and_z[rank, 0, :],
             all_ranks_s_and_z[rank, 1, :],
+            state.dtype,
         )
+        # Store quantization error in error_dict
+        if state.use_error_feedback:
+            if quantized_tensor is None:
+                raise AssertionError
+            n = tensor.numel()
+            shape = tensor.shape
+            restored_quantized_tensor = quantized_tensor.flatten()[:n].view(shape)
+            state.error_dict[bucket_index] = tensor - restored_quantized_tensor
         # Allgather quantized tensors.
         fut = dist.all_gather(
             _get_allgather_out_list(quantized_tensor, world_size),

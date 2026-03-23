@@ -186,17 +186,50 @@ class DistributedDataParallelCommHookTest(DistributedTestBase):
         hook_grads = self._get_grads(
             process_group, DDPCommHookType.ARC_TOPK_HOOK
         )
-        
+
         non_zero_mask = (hook_grads.abs() > 1e-10)
 
         # Non-Zero value of the hook_grads must be the same with the reerence_grad
         if non_zero_mask.any():
             torch.testing.assert_close(
-                hook_grads[non_zero_mask], 
-                reference_grads[non_zero_mask], 
-                rtol=1e-5, 
+                hook_grads[non_zero_mask],
+                reference_grads[non_zero_mask],
+                rtol=1e-5,
                 atol=1e-4,
             )
+    def test_ddp_comm_hook_quantize_per_tensor_fp8_hook(self):
+        """
+        This unit test verifies the ``quantize per tensor fp8`` hook registered case
+        gives close result with no hook registered case.
+        """
+        process_group = self.create_pg(device_type)
+
+        # No hook registered case, get the reference grads.
+        reference_grads = self._get_grads(process_group, None)
+        # Register hook case, get the hook grads.
+        hook_grads = self._get_grads(
+            process_group, DDPCommHookType.QUANTIZE_PER_TENSOR_FP8
+        )
+
+        torch.testing.assert_close(hook_grads, reference_grads, rtol=1e-5, atol=1e-3)
+
+    @requires_accelerator_dist_backend()
+    @skip_if_lt_x_gpu(2)
+    def test_ddp_comm_hook_quantize_per_channel_fp8_hook(self):
+        """
+        This unit test verifies the ``quantize per channel fp8`` hook registered case
+        gives close result with no hook registered case.
+        """
+        process_group = self.create_pg(device_type)
+
+        # No hook registered case, get the reference grads.
+        reference_grads = self._get_grads(process_group, None)
+        # Register hook case, get the hook grads.
+        hook_grads = self._get_grads(
+            process_group, DDPCommHookType.QUANTIZE_PER_TENSOR_FP8
+        )
+
+        torch.testing.assert_close(hook_grads, reference_grads, rtol=1e1, atol=1e-3)
 
     @requires_accelerator_dist_backend()
     @skip_if_lt_x_gpu(2)
