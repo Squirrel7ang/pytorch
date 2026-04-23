@@ -213,6 +213,48 @@ class DistributedDataParallelCommHookTest(DistributedTestBase):
 
         torch.testing.assert_close(hook_grads, reference_grads, rtol=1e-5, atol=1e-3)
 
+
+    @requires_accelerator_dist_backend()
+    @skip_if_lt_x_gpu(2)
+    def test_ddp_comm_hook_compare(self):
+        process_group = self.create_pg(device_type)
+
+        def _calc_metrics(hook_grads, ref_grads):
+            hook_vec = torch.cat([g.view(-1) for g in hook_grads])
+            ref_vec = torch.cat([g.view(-1) for g in ref_grads])
+
+            diff_norm = torch.linalg.norm(hook_vec - ref_vec)
+            ref_norm = torch.linalg.norm(ref_vec)
+            rel_error = diff_norm / (ref_norm + 1e-8)
+
+
+            cos_sim = torch.nn.functional.cosine_similarity(hook_vec, ref_vec, dim=0)
+
+            return rel_error.item(), cos_sim.item()
+
+        # No hook registered case, get the reference grads.
+        reference_grads = self._get_grads(process_group, None)
+        # Register hook case, get the hook grads.
+        fp8_grads = self._get_grads(
+            process_group, DDPCommHookType.QUANTIZE_PER_TENSOR_FP8
+        )
+        topk_005_grads = self._get_grads(
+            process_group, DDPCommHookType.ARC_TOPK_HOOK
+        )
+        powerSGD_grads = self._get_grads(
+            process_group, DDPCommHookType.POWER_SGD
+        )
+
+        # Compare with reference grad
+        fp8_rel, fp8_cos = _calc_metrics(fp8_grads, reference_grads)
+        topk_005_rel, topk_005_cos = _calc_metrics(topk_005_grads, reference_grads)
+        power_rel, power_cos = _calc_metrics(powerSGD_grads, reference_grads)
+
+        print(f"FP8 Hook: Rel Error = {fp8_rel:.4f}, Cos Sim = {fp8_cos:.4f}")
+        print(f"TopK Hook: Rel Error = {topk_005_rel:.4f}, Cos Sim = {topk_005_cos:.4f}")
+        print(f"PowerSGD:  Rel Error = {power_rel:.6f}, Cos Sim = {power_cos:.6f}")
+
+
     @requires_accelerator_dist_backend()
     @skip_if_lt_x_gpu(2)
     def test_ddp_comm_hook_quantize_per_channel_fp8_hook(self):
