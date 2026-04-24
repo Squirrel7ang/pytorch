@@ -4,11 +4,64 @@ import torch.distributed as dist
 from torch import nn
 
 
+def _is_integer(dtype: torch.dtype):
+    return dtype in [
+        torch.uint8,
+        torch.uint16,
+        torch.uint32,
+        torch.uint64,
+        torch.int8,
+        torch.int16,
+        torch.short,
+        torch.int32,
+        torch.int,
+        torch.int64,
+        torch.long,
+        torch.quint8,
+        torch.qint8,
+        torch.qint32,
+        torch.bool,
+        torch.quint4x2,
+        torch.quint2x4,
+    ]
+
+
+def _pack_for_bits4x2(x: torch.Tensor):
+    x = x.view(-1)
+    n = x.numel()
+    len = (n+1) // 2
+
+    y = torch.empty(len, dtype=x.dtype, device=x.device)
+    limit = (n // 2) * 2
+
+    x_pair = x[:limit]
+    y[:limit] = (x_pair[0::2] & 0x0F) << 4 | (x_pair[1::2] & 0x0F)
+
+    if n % 2 == 1:
+        y[-1] = x[-1]
+    return y
+
+
+def _unpack_for_bits4x2(y: torch.Tensor, origin: torch.Tensor):
+    n = origin.numel()
+    x = torch.empty_like(origin)
+    x[0::2] = (y[:(n//2)] & 0xF0) >> 4
+    x[1::2] = (y[:(n//2)] & 0x0F)
+    if n % 2 == 1:
+        x[-1] = y[-1]
+    return x
+
+
 def _get_dtype_range(dtype):
     if dtype.is_floating_point:
         info = torch.finfo(dtype)
-    else:
+    elif _is_integer(dtype):
         info = torch.iinfo(dtype)
+    elif dtype is torch.bits4x2:
+        return -8, 7
+    else:
+        raise NotImplementedError(f"Unsupported dtype: {dtype=}")
+
     return info.min, info.max
 
 
@@ -16,14 +69,25 @@ def _quantize_per_tensor_backend(x, scale, zero_point, dtype):
     d_min, d_max = _get_dtype_range(dtype)
     if dtype.is_floating_point:
         y = x / scale + zero_point
-    else:
+        y = torch.clamp(y, d_min, d_max).to(dtype)
+    elif _is_integer(dtype):
         y = torch.round(x / scale) + zero_point
-    y = torch.clamp(y, d_min, d_max).to(dtype)
+        y = torch.clamp(y, d_min, d_max).to(dtype)
+    elif dtype is torch.bits4x2:
+        y = torch.round(x / scale) + zero_point
+        y = torch.clamp(y, d_min, d_max).to(torch.uint8)
+        y = _pack_for_bits4x2(y)
+    else:
+        raise NotImplementedError(f"Unsupported dtype: {dtype=}")
     return y
 
 
-def _dequantize_per_tensor_backend(y, scale, zero_point):
-    x = scale * (y.to(torch.float32) - zero_point)
+def _dequantize_per_tensor_backend(y, scale, zero_point, dtype, origin=None):
+    if dtype is torch.bits4x2:
+        x = _unpack_for_bits4x2(y, origin)
+        x = scale * (x.to(torch.float32) - zero_point)
+    else:
+        x = scale * (y.to(torch.float32) - zero_point)
     return x
 
 

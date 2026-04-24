@@ -135,6 +135,13 @@ class DDPCommHookType(Enum):
             dtype=torch.float8_e4m3fn
         )
     )
+    QUANTIZE_PER_TENSOR_INT4 = _enum_member(
+        partial(
+            _quantization_comm_hook_wrapper,
+            comm_hook=quantization.quantization_pertensor_hook,
+            dtype=torch.bits4x2
+        )
+    )
     POWER_SGD = _enum_member(
         partial(
             _powerSGD_comm_hook_wrapper,
