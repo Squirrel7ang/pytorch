@@ -215,7 +215,7 @@ def quantization_pertensor_hook(
                 total_length,
             )
             state.error_dict[bucket_index] = torch.zeros(
-                total_length, device=device, dtype=dtype
+                total_length, device=tensor.device, dtype=dtype
             )
 
     # TODO: recheck if dtype is correct. The previous dtype is torch.quint8, which
@@ -320,7 +320,7 @@ def quantization_perchannel_hook(
                 total_length,
             )
             state.error_dict[bucket_index] = torch.zeros(
-                total_length, device=device, dtype=dtype
+                total_length, device=tensor.device, dtype=dtype
             )
 
     tensor_in_channels = (
